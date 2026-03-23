@@ -1,0 +1,249 @@
+========================================
+  aiter JIT 编译系统梳理
+  (基于 aiter/jit/core.py 和 aiter/jit/utils/cpp_extension.py)
+========================================
+
+一、整体架构
+========================================
+
+aiter 在 PyTorch torch.utils.cpp_extension 基础上，自建了一套 C++/HIP 算子的
+编译 + 加载 + 调用框架。
+
+层次结构（自顶向下）：
+
+  用户代码:  my_quant_op(x, s)
+  ─────────────────────────────────────
+  compile_ops 装饰器                        ← aiter 自建
+  - 懒编译触发、模块缓存、类型检查
+  ─────────────────────────────────────
+  optCompilerConfig.json                    ← aiter 自建
+  - 集中管理所有模块的源文件/flags/includes
+  ─────────────────────────────────────
+  build_module                              ← aiter 自建
+  - 组装编译参数、多进程锁、blob 代码生成
+  - HIP 版本适配、GPU 架构选择
+  ─────────────────────────────────────
+  两条 FFI 路径                              ← aiter 自建
+  - pybind: importlib 加载 .so -> getattr 拿函数
+  - ctypes: dlopen .so -> 类型注解自动映射 C ABI
+  ─────────────────────────────────────
+  魔改的 cpp_extension.py                    ← fork 自 PyTorch
+  - _jit_compile -> 生成 build.ninja -> ninja 构建
+  ─────────────────────────────────────
+  hipcc / c++                               ← 系统工具
+
+
+二、完整编译流程
+========================================
+
+  配置 -> 构建(代码生成 -> 编译 -> 链接) -> 拷贝 -> 加载 -> 调用
+
+详细展开：
+
+1. 配置（get_args_of_build, core.py L934）
+   读 optCompilerConfig.json，组装 srcs/flags/includes
+
+2. 代码生成（build_module 内部）
+   - clone_3rdparty()          克隆依赖库（HipKittens/CK）
+   - rename_cpp_to_cu()        .cpp -> .cu 重命名拷贝
+   - exec_blob(blob_gen_cmd)   执行代码生成脚本（如 CK instance）
+   - hipify()                  CUDA 语法 -> HIP 语法转换
+
+3. 编译（ninja 调用 hipcc）
+   hipcc -c src1.cu -o src1.cuda.o
+   hipcc -c src2.cu -o src2.cuda.o
+   （多个源文件并行，由 MAX_JOBS 控制）
+
+4. 链接（ninja 调用 c++）
+   c++ -shared src1.cuda.o src2.cuda.o -ltorch -lamdhip64 ... -o module.so
+
+   注意：编译用 hipcc，链接用 c++（g++）
+
+5. 拷贝（build_module 末尾）
+   shutil.copy(build_dir/module.so -> jit_dir/module.so)
+
+6. 加载（get_module -> importlib.import_module）
+   Python 的 importlib 加载 .so 为一个 module 对象
+
+7. 调用（wrapper 末尾）
+   op = getattr(module, func_name)
+   op(*args, **kwargs)
+
+
+三、核心调用链
+========================================
+
+  compile_ops (装饰器, core.py L1239)
+    -> wrapper() 中 ModuleNotFoundError 时
+        -> get_args_of_build(md_name)     读 optCompilerConfig.json
+        -> build_module(md_name, ...)     组装参数，多进程锁
+            -> _jit_compile(...)          版本检查，hipify
+                -> _write_ninja_file_and_build_library()
+                    -> _write_ninja_file_to_build_library()
+                        -> _write_ninja_file()     生成 build.ninja
+                    -> _run_ninja_build()           执行 ninja 构建
+
+
+四、compile_ops 装饰器
+========================================
+
+compile_ops(_md_name, fc_name, gen_func, gen_fake, ffi_type) 是一个装饰器工厂。
+
+使用方式：
+  @compile_ops("module_quant")
+  def my_quant_op(input: torch.Tensor, scale: torch.Tensor):
+      ...
+
+两条 FFI 路径：
+
+路径 A: ffi_type == "ctypes"
+  - _ctypes_call() 构建 ctypes 调用器
+  - 延迟加载 .so，第一次调用时触发编译
+  - Python 类型注解自动映射到 C ABI (Tensor->AiterTensor*, int->c_int 等)
+  - 自动追加 hipStream_t 参数
+  - torch_exclude=True，不链接 torch 库
+
+路径 B: ffi_type == "pybind"（默认）
+  - importlib 加载 .so
+  - getattr 拿到 C++ 导出的函数
+  - 首次调用时做类型检查（解析 pybind docstring 获取 C++ 签名）
+
+
+五、多进程编译机制
+========================================
+
+两个维度：
+
+1) 进程间互斥（同一模块不重复编译）
+
+  使用 FileBaton（基于文件的自旋锁）：
+  - try_acquire(): os.open(path, O_CREAT | O_EXCL) 原子创建文件
+  - wait(): while os.path.exists(path): sleep(0.2) 自旋等待
+  - release(): os.remove(path) 删文件释放锁
+
+  有两层锁：
+  - 第1层: build_module() 里的 mp_lock(f"{bd_dir}/lock_{md_name}")
+  - 第2层: _jit_compile() 里的 FileBaton(build_directory/lock)
+
+  场景：多个 GPU worker 同时 import 同一算子，只有一个进程编译，
+  其他进程等待编译完成后直接使用 .so。
+
+2) 单模块内多源文件并行编译（Ninja 并行）
+
+  check_and_set_ninja_worker() 计算:
+    max_jobs = min(CPU核数*0.8, 可用内存GB/0.5)
+  设置到 MAX_JOBS 环境变量，ninja 据此并行调用多个 hipcc。
+
+
+六、_jit_compile 详解
+========================================
+
+_jit_compile 从 PyTorch 的 torch.utils.cpp_extension fork 而来。
+
+流程：
+  1. 版本检查 (ExtensionVersioner)
+     对比 sources + flags 是否有变化
+     - 没变 -> 跳过编译
+     - 有变 -> bump version，继续
+
+  2. FileBaton 加锁
+
+  3. hipify（可选）
+     CUDA 语法转 HIP 语法（cudaMalloc -> hipMalloc 等）
+
+  4. _write_ninja_file_and_build_library()
+     4a. 准备 flags
+         - cflags:  -fPIC, -std=c++20, pybind11 ABI flags, -I(includes)
+         - cuda_flags: -DWITH_HIP, --offload-arch=gfxXXX
+         - ldflags: -mcmodel=large, -ltorch, -lamdhip64, -shared
+
+     4b. _write_ninja_file()
+         生成 build.ninja 文件（施工图纸），内容包含：
+         - rule cuda_compile: $nvcc(hipcc) -c $in -o $out
+         - rule link: $cxx(c++) @$out.rsp $ldflags -o $out
+         - build xxx.cuda.o: cuda_compile xxx.cu  （每个源文件一条）
+         - build module.so: link xxx.cuda.o ...
+
+     4c. _run_ninja_build()
+         subprocess.run(["ninja", "-v", "-j", MAX_JOBS])
+         ninja 读 build.ninja，调用 hipcc 编译、c++ 链接
+
+
+七、build.ninja 文件结构示例
+========================================
+
+  ninja_required_version = 1.3
+  cxx = c++
+  nvcc = /opt/rocm/bin/hipcc
+
+  rule cuda_compile
+    command = $nvcc $cuda_cflags -c $in -o $out $cuda_post_cflags
+
+  rule link
+    command = $cxx @$out.rsp $ldflags -o $out
+    rspfile = $out.rsp
+    rspfile_content = $in
+
+  build src1.cuda.o: cuda_compile /path/to/src1.cu
+  build src2.cuda.o: cuda_compile /path/to/src2.cu
+
+  build module.so: link src1.cuda.o src2.cuda.o
+
+  default module.so
+
+注意：变量名 nvcc 实际指向 hipcc，是从 PyTorch 代码继承的命名。
+
+
+八、torch_exclude 参数
+========================================
+
+控制编译时是否排除 PyTorch 依赖。
+
+torch_exclude=False（默认，pybind路径）:
+  - 链接 -ltorch, -lc10, -ltorch_hip, -ltorch_python
+  - include torch 头文件
+  - 定义 TORCH_EXTENSION_NAME 宏
+
+torch_exclude=True（ctypes路径）:
+  - 不链接任何 torch 库
+  - 不 include torch 头文件
+  - 编译出纯 HIP C++ 的 .so
+  - Python 侧通过 ctypes 调用
+
+
+九、关键辅助组件
+========================================
+
+  组件                        作用
+  -------------------------   -------------------------------------------
+  optCompilerConfig.json      所有模块的编译配置
+  FileBaton / mp_lock         文件锁 + 自旋等待，多进程互斥
+  check_and_set_ninja_worker  根据 CPU/内存动态设置 ninja 并行数
+  validate_and_update_archs   校验 GPU_ARCHS 环境变量
+  hip_flag_checker            用 hipcc 验证 flag 是否被当前 ROCm 支持
+  torch_compile_guard         处理 torch.compile 兼容性和 fake tensor
+  ExtensionVersioner          对比源文件/flags 变化，决定是否重编
+  AITER_REBUILD 环境变量       0=正常缓存, 1=清除rebuild, 2+=仅删so
+
+
+十、aiter vs PyTorch 原生 cpp_extension
+========================================
+
+  需求                          PyTorch 原生       aiter 自建
+  ---------------------------   ----------------   -------------------------
+  集中管理几十个算子编译配置       不支持             optCompilerConfig.json
+  不依赖 torch 的纯 HIP 算子     不支持             torch_exclude + ctypes
+  多进程安全                      基本锁             两层 FileBaton
+  blob 代码生成                   不支持             blob_gen_cmd
+  ROCm/HIP 版本适配 flags        不支持             按 hip_version 动态加 flags
+  torch.compile 兼容             不管               torch_compile_guard
+  装饰器一行搞定                  需手动 load        @compile_ops 全自动
+
+
+十一、工具角色澄清
+========================================
+
+  - Ninja: 构建工具（调度者），类似 Make，读 build.ninja 按依赖执行命令
+  - hipcc: 编译器（AMD ROCm 的 HIP C++ 编译器），负责 .cu -> .o
+  - c++/g++: 链接器，负责 .o -> .so
+  - Ninja 自己不编译也不链接，只决定"什么时候执行哪条命令"
