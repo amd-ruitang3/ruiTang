@@ -1,1 +1,127 @@
-this file is about ffi to bind aiter's kernels.
+aiter FFI 绑定方案 —— 去 torch 依赖重构
+==========================================
+
+## 1. 绑定方式选型：ctypes
+
+结论：用 ctypes，不用 pybind11，不用 TVM FFI。
+
+理由：
+- 目标是去掉 torch 依赖，pybind11 现有绑定全是 torch::Tensor 参数，去掉后 pybind 多余
+- aiter_tensor_t 是 POD struct（160 字节，fixed layout），ctypes 天然匹配
+- C 侧 extern "C" 裸函数，无 C++ 类/模板/异常/重载，ctypes 完全够用
+- 编译更快：不需要 pybind11/torch 头文件，hipcc 编译纯 HIP 代码
+- ctypes 是 Python 标准库，零额外依赖
+- TVM FFI 太重（引入 TVM runtime），且已有自定义 AiterTensor，不需要 DLTensor
+
+现状：csrc/py_itfs_cu/ 下的 asm kernel 已经在用 ctypes + AiterTensor 方案。
+
+
+## 2. 类型命名约定
+
+- aiter_tensor_t  — POD 结构体，C ABI / ctypes 用，snake_case + _t 后缀（同 hipStream_t 风格）
+- AiterTensor     — RAII C++ 类，继承 aiter_tensor_t，PascalCase（C++ 类惯例）
+
+大小写自然区分两个层次，一看就知道谁是谁。
+
+
+## 3. AiterTensor RAII 类设计
+
+AiterTensor 继承 aiter_tensor_t，增加：
+- 构造/析构自动管理 GPU 内存（hipMalloc/hipFree）
+- 工厂方法：AiterTensor::empty(...) 和 AiterTensor::zeros(...)
+- 禁止拷贝，允许移动
+
+用法（手感类似 torch）：
+    auto ws = AiterTensor::empty({1024}, AITER_DTYPE_u8, input->device_id, stream);
+    auto tmp = AiterTensor::zeros({M, N}, AITER_DTYPE_fp32, input->device_id, stream);
+    launch<<<grid, block, 0, stream>>>(..., ws.data_ptr(), tmp.data_ptr());
+    // 函数返回，自动释放
+
+继承关系保证 AiterTensor* 可直接传给所有接收 aiter_tensor_t* 的函数。
+
+
+## 4. 架构分工：Python 做管理，C 做计算
+
+    Python (torch.Tensor)
+        |  torch_to_aiter()  零拷贝
+        v
+    aiter_tensor_t (ctypes.Structure, 160 bytes)
+        |  ctypes.CDLL("lib.so").func(ctypes.byref(at), stream)
+        v
+    C: extern "C" void func(aiter_tensor_t*, hipStream_t)
+        |  直接用 ptr->data_ptr(), ptr->size(0) 等
+        v
+    HIP kernel launch
+
+Python 端职责：
+- torch.empty/zeros 分配所有输入输出 tensor
+- torch_to_aiter() 转为 aiter_tensor_t
+- 取 stream（torch.cuda.current_stream().cuda_stream）
+- 取 RNG seed/offset
+- 类型分派（按 dtype 选函数）
+
+C 端职责（零 torch 依赖）：
+- 只接 aiter_tensor_t* 和标量参数
+- HipDeviceGuard(tensor->device_id) 设置 device
+- AiterTensor::empty/zeros 分配临时 workspace（RAII 自动释放）
+- AITER_CHECK 替代 TORCH_CHECK
+- hipLaunchKernelGGL 启动 kernel
+- 不分配返回给 Python 的 tensor
+
+
+## 5. csrc/kernels/ 下 torch 依赖替换方案
+
+### 5.1 已有替代（直接替换）
+- torch::Tensor 参数         -> aiter_tensor_t*（AiterTensor 已覆盖所有访问器）
+- TORCH_CHECK               -> AITER_CHECK（已有）
+- device_guard               -> HipDeviceGuard（已有）
+- at::hip::getCurrentHIPStream -> 函数参数传入 hipStream_t
+
+### 5.2 需实现
+- AT_DISPATCH/VLLM_DISPATCH  -> 自定义 AITER_DISPATCH_DTYPE 宏（switch AiterDtype）
+- torch::empty/zeros(workspace) -> AiterTensor::empty/zeros（RAII）
+- torch::empty/zeros(output)   -> Python 预分配传入
+- torch::from_blob + .to()     -> hipMemcpyAsync（host->device 拷贝）
+- .contiguous()                -> Python 端保证 或 AITER_CHECK(is_contiguous)
+- .to(CPU) / .copy_()         -> hipMemcpy / hipMemcpyAsync
+- torch::promote_types         -> Python 端决定 output dtype 传入
+- at::ScalarType              -> AiterDtype 枚举
+
+### 5.3 特殊处理
+- Philox RNG（仅 sample_kernels.cu）：
+  Python 端取 seed/offset 传入，C 侧自实现 Philox（~20 行代码）
+
+- vector<Tensor> 返回值（mla/metadata 等）：
+  Python 预分配所有 output tensor，C 只填数据，返回 void
+
+- vector<Tensor> 输入参数（cache, all_reduce）：
+  Python 拼指针数组（torch.tensor([t.data_ptr() for t in caches])），C 接 int64_t*
+
+### 5.4 暂缓
+- custom_all_reduce.cu / quick_all_reduce.cu：
+  通信模块与 torch distributed 深度耦合（IPC handle, buffer 注册等），建议最后迁移
+
+
+## 6. stream 传递方式（待定）
+
+当前方案：ctypes.c_void_p(torch.cuda.current_stream().cuda_stream) 每次传入
+讨论过的替代方案：
+- 方案 A：放入 aiter_tensor_t.stream 字段（语义上 stream 不属于 tensor）
+- 方案 B：独立 AiterExecCtx 结构体（可扩展 workspace/event 等）
+- 方案 C：保持现状，函数参数传入
+
+尚未最终确定，后续继续讨论。
+
+
+## 7. 迁移难度排序
+
+    容易 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 困难
+
+    1. TORCH_CHECK      ->  AITER_CHECK          (纯文本替换)
+    2. device_guard      ->  HipDeviceGuard        (纯文本替换)
+    3. tensor 访问器     ->  aiter_tensor_t 方法    (纯文本替换)
+    4. getCurrentStream  ->  参数传入               (改函数签名)
+    5. AT_DISPATCH       ->  switch(dtype)          (重写宏展开)
+    6. torch::empty      ->  AiterTensor / Python   (改调用约定)
+    7. RNG (Philox)      ->  自实现 or 保留          (需要独立实现)
+    8. 通信 (all_reduce)  ->  保留 torch 依赖        (耦合太深)
