@@ -247,3 +247,9 @@ torch_exclude=True（ctypes路径）:
   - hipcc: 编译器（AMD ROCm 的 HIP C++ 编译器），负责 .cu -> .o
   - c++/g++: 链接器，负责 .o -> .so
   - Ninja 自己不编译也不链接，只决定"什么时候执行哪条命令"
+
+
+十二、代码风格规则
+========================================
+
+  - 所有修改的 Python 文件必须用 python3 -m black <file> 格式化后再提交

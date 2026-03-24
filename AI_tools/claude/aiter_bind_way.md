@@ -143,3 +143,9 @@ Not finalized yet.
 | 6 | `torch::empty` → `AiterTensor` / Python | Calling convention change |
 | 7 | RNG (Philox) | Independent implementation |
 | 8 | Communication (all_reduce) | Keep torch dep (too coupled) |
+
+---
+
+## 8. Code Style Rules
+
+- All modified Python files must be formatted with `python3 -m black <file>` before committing.
