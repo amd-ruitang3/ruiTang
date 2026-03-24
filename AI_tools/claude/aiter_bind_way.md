@@ -129,6 +129,34 @@ HIP kernel launch
 
 Not finalized yet.
 
+### Stream 背景知识
+
+- `hipStream_t` = `typedef struct ihipStream_t*`，定义在 `/opt/rocm/include/hip/hip_runtime_api.h`
+- Stream 是 GPU 命令队列（软件抽象），同一 stream 内顺序执行，不同 stream 可并发
+- 每个 GPU 可创建任意多个 stream，底层映射到硬件 HW Queue（数量有限，runtime 复用）
+- Default stream (NULL) 全局串行，非 default stream 支持异步并发
+
+### PyTorch `getCurrentHIPStream` 原理
+
+PyTorch 的实现（`c10/cuda/CUDAStream.cpp`）核心是：
+- `thread_local` 数组存每个 device 的"当前 stream"
+- 默认值是 default stream (NULL)
+- 额外维护 32 个 stream 的 pool，round-robin 分配
+
+### 纯 HIP 替代方案（已实现 `aiter_stream.h`，暂未启用）
+
+已在 `csrc/include/aiter_stream.h` 实现轻量版，纯 HIP 无 torch 依赖：
+```cpp
+namespace aiter {
+// thread_local per-device stream 数组，默认 NULL (hipStreamDefault)
+hipStream_t getCurrentHIPStream(int device_id);
+void setCurrentHIPStream(int device_id, hipStream_t stream);
+}
+```
+
+当前策略：C 端通过函数参数接收 `hipStream_t`，由 Python 端从 torch 获取后传入。
+将来完全去 torch 后，Python 可通过 `hip-python` 包或 `aiter::getCurrentHIPStream` 获取。
+
 ---
 
 ## 7. Migration Difficulty (easy → hard)
