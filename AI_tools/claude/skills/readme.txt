@@ -22,3 +22,8 @@ skill 的格式：
   2.1 claude 帮你创建
   2.2 claude-creator plugin 帮你创建
       它还可以帮你 eval
+
+
+怎么触发
+1. 自动触发
+2. /AAAAA 手动触发
