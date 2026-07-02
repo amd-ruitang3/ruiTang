@@ -17,6 +17,9 @@ skill 的格式：
 1. 抄别人的
   1.1 claude 官方  /plugin
   1.2 第三方网站 skillsmp
+        https://skillsmp.com/search  
+            ** 常用的好的 skill **:
+                > pr-review
   1.3 github 里有一手的
 2. 自己创建 
   2.1 claude 帮你创建
