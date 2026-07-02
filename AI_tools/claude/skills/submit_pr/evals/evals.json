@@ -1,0 +1,26 @@
+{
+  "skill_name": "submit_pr",
+  "evals": [
+    {
+      "id": 0,
+      "name": "conv-python-unformatted",
+      "prompt": "I finished my change to kernel.py in this repo. Submit a PR for it.",
+      "expected_output": "New feature branch off main; kernel.py reformatted to pass black + ruff format; commit authored as amd-ruitang3 <Rui.Tang2@amd.com> with a Conventional-Commits subject matching the repo's history and a Co-Authored-By trailer; branch pushed to origin; a PR title/body drafted and (since gh is absent) a compare URL printed.",
+      "files": []
+    },
+    {
+      "id": 1,
+      "name": "plain-imperative-doc-fix",
+      "prompt": "Open a pull request for the README tweak I just made.",
+      "expected_output": "Stays on the existing tweak-readme branch; commit authored as amd-ruitang3 <Rui.Tang2@amd.com> with a PLAIN IMPERATIVE subject (NOT Conventional Commits) matching the repo's history; lean PR body without padded/empty sections; no black/ruff error despite there being no python files; branch pushed and compare URL printed.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "name": "fork-python-fallback-url",
+      "prompt": "Please raise a PR upstream with my attn.py changes.",
+      "expected_output": "Detects the fork workflow (origin=fork amd-ruitang3/aiter, upstream=ROCm/aiter); new branch pushed to origin fork; attn.py reformatted (black+ruff); commit authored as amd-ruitang3 <Rui.Tang2@amd.com>, conventional subject; since gh is absent, prints an upstream compare URL of the form https://github.com/ROCm/aiter/compare/main...amd-ruitang3:<branch>?expand=1.",
+      "files": []
+    }
+  ]
+}
