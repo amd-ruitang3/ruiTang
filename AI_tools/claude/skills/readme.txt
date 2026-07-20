@@ -20,6 +20,7 @@ skill 的格式：
         https://skillsmp.com/search  
             ** 常用的好的 skill **:
                 > pr-review
+                > claude-hud https://github.com/jarrodwatts/claude-hud
   1.3 github 里有一手的
 2. 自己创建 
   2.1 claude 帮你创建
